@@ -277,6 +277,22 @@ where
         Ok(())
     }
 
+    /// Records the binding introduced by a declaration identifier (e.g. the
+    /// name of a function or class declaration) for source map scopes.
+    ///
+    /// Synthetic identifiers (with a dummy span) are skipped, see
+    /// [scope_helpers::scope_binding_name].
+    #[inline(always)]
+    fn add_scope_ident_binding(&mut self, ident: &Ident, storage: BindingStorage) -> Result {
+        if self.scope_tracking_enabled() {
+            if let Some(name) = scope_helpers::scope_binding_name(ident) {
+                self.wr.add_scope_variable(name, Some(name), storage)?;
+            }
+        }
+
+        Ok(())
+    }
+
     fn emit_new(&mut self, node: &NewExpr, should_ignore_empty_args: bool) -> Result {
         self.wr.commit_pending_semi()?;
 

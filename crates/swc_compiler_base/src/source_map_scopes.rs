@@ -1,5 +1,21 @@
+//! Encoding of the ECMA-426 source map `scopes` proposal
+//! (<https://github.com/tc39/ecma426/blob/main/proposals/scopes.md>).
+//!
+//! The scope records are collected by the code generator (see
+//! [`swc_ecma_codegen::text_writer::JsWriter::new_with_scopes`]). Typical
+//! usage:
+//!
+//! 1. Emit the program with a
+//!    [`JsWriter`](swc_ecma_codegen::text_writer::JsWriter) created via
+//!    `new_with_scopes`.
+//! 2. Register [`collect_additional_names`] in the `names` of the source map
+//!    (e.g. via [`swc_common::source_map::SourceMapGenConfig::for_each_additional_name`])
+//!    while building it.
+//! 3. Call [`encode_scopes`] and store the result with
+//!    [`swc_sourcemap::SourceMap::set_scopes`].
+
 use rustc_hash::{FxHashMap, FxHashSet};
-use swc_common::{FileName, SourceMap as CommonSourceMap, Span};
+use swc_common::{FileName, SourceMapper, Span};
 use swc_ecma_codegen::text_writer::ScopeRecord;
 
 #[derive(Debug, Clone, Copy)]
@@ -51,6 +67,12 @@ struct GeneratedState {
     prev_definition: i64,
 }
 
+/// Returns the strings that [`encode_scopes`] references from the `names` of
+/// the source map (scope kinds, scope names, variable names and binding
+/// expressions), in a stable order and without duplicates.
+///
+/// These have to be added to the source map's `names` before calling
+/// [`encode_scopes`], otherwise encoding fails.
 pub fn collect_additional_names(scopes: &[ScopeRecord]) -> Vec<String> {
     let mut names = vec![];
     let mut seen = FxHashSet::default();
@@ -83,9 +105,26 @@ pub fn collect_additional_names(scopes: &[ScopeRecord]) -> Vec<String> {
     names
 }
 
+/// Encodes `scopes` as the value of the source map `scopes` field.
+///
+/// - `cm` is used to resolve the original spans of the scopes, e.g. the
+///   [`swc_common::SourceMap`] used for parsing.
+/// - `map` is the source map built for the generated code. Its `sources` and
+///   `names` are used to resolve indices, so it must contain the names returned
+///   by [`collect_additional_names`].
+/// - `source_name_for_file` must map a file name to the corresponding entry in
+///   the `sources` of `map` (i.e. the same mapping used when building `map`).
+///
+/// Original scopes are emitted in original position order. Original scopes
+/// that can't be represented as a properly nested tree (e.g. because a
+/// transform produced overlapping spans) are omitted; generated ranges that
+/// referenced them are kept without a definition.
+///
+/// Returns `None` if there is nothing to encode or a referenced name is
+/// missing from `map`.
 pub fn encode_scopes(
     scopes: &[ScopeRecord],
-    cm: &CommonSourceMap,
+    cm: &dyn SourceMapper,
     map: &swc_sourcemap::SourceMap,
     mut source_name_for_file: impl FnMut(&FileName) -> String,
 ) -> Option<String> {
@@ -217,6 +256,26 @@ pub fn encode_scopes(
             children: std::mem::take(roots),
         });
         roots.push(synthetic_root);
+    }
+
+    // Original scopes were collected in *generated* order. Transforms (e.g. the
+    // compressor or a bundler) may reorder code, so put them into original
+    // position order and drop scopes that can't be represented as a properly
+    // nested tree. Otherwise the relative (unsigned) position encoding below
+    // would produce corrupted positions.
+    let mut removed_original = vec![false; original_nodes.len()];
+    for roots in &mut original_roots_by_source {
+        if let Some(&root) = roots.first() {
+            normalize_original_scope_tree(root, &mut original_nodes, &mut removed_original);
+            if removed_original[root] {
+                roots.clear();
+            }
+        }
+    }
+    for original in &mut scope_to_original {
+        if original.is_some_and(|idx| removed_original[idx]) {
+            *original = None;
+        }
     }
 
     let mut generated_nodes = vec![];
@@ -392,7 +451,7 @@ fn build_generated_range_tree(
 }
 
 fn span_to_original_position(
-    cm: &CommonSourceMap,
+    cm: &dyn SourceMapper,
     span: Span,
     source_name_for_file: &mut impl FnMut(&FileName) -> String,
 ) -> Option<(String, Pos, Pos)> {
@@ -418,6 +477,69 @@ fn span_to_original_position(
             column: end.col.0 as u32,
         },
     ))
+}
+
+#[inline]
+fn pos_key(pos: Pos) -> (u32, u32) {
+    (pos.line, pos.column)
+}
+
+/// Sorts the children of every original scope by their original start
+/// position and removes children (with their whole subtree) that are not
+/// contained in their parent or overlap a preceding sibling.
+///
+/// The scopes proposal requires original scopes to form a properly nested
+/// tree with siblings in source order, as positions are encoded relative to
+/// the preceding item with unsigned deltas.
+///
+/// The root itself is removed if its start is after its end.
+fn normalize_original_scope_tree(
+    root: usize,
+    nodes: &mut [OriginalScopeNode],
+    removed: &mut [bool],
+) {
+    if pos_key(nodes[root].start) > pos_key(nodes[root].end) {
+        mark_original_subtree_removed(root, nodes, removed);
+        return;
+    }
+
+    let mut stack = vec![root];
+    while let Some(node_idx) = stack.pop() {
+        let mut children = std::mem::take(&mut nodes[node_idx].children);
+        // Stable sort keeps the generated order for scopes starting at the same
+        // position; wider scopes first, so an outer scope stays before an inner
+        // scope that starts at the same position.
+        children.sort_by(|&a, &b| {
+            pos_key(nodes[a].start)
+                .cmp(&pos_key(nodes[b].start))
+                .then_with(|| pos_key(nodes[b].end).cmp(&pos_key(nodes[a].end)))
+        });
+
+        let parent_end = pos_key(nodes[node_idx].end);
+        let mut prev_end = pos_key(nodes[node_idx].start);
+        let mut kept = Vec::with_capacity(children.len());
+        for child in children {
+            let start = pos_key(nodes[child].start);
+            let end = pos_key(nodes[child].end);
+            if start < prev_end || end > parent_end || start > end {
+                mark_original_subtree_removed(child, nodes, removed);
+                continue;
+            }
+            prev_end = end;
+            kept.push(child);
+        }
+
+        stack.extend(kept.iter().copied());
+        nodes[node_idx].children = kept;
+    }
+}
+
+fn mark_original_subtree_removed(root: usize, nodes: &[OriginalScopeNode], removed: &mut [bool]) {
+    let mut stack = vec![root];
+    while let Some(idx) = stack.pop() {
+        removed[idx] = true;
+        stack.extend(nodes[idx].children.iter().copied());
+    }
 }
 
 fn assign_definition_indices(
@@ -894,6 +1016,55 @@ mod tests {
         let first = encode_scopes(&scopes, &cm, &map, |file_name| file_name.to_string()).unwrap();
         let second = encode_scopes(&scopes, &cm, &map, |file_name| file_name.to_string()).unwrap();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn drops_overlapping_original_scopes() {
+        let cm = SourceMap::new(FilePathMapping::empty());
+        let fm = cm.new_source_file(
+            FileName::Real("input.js".into()).into(),
+            "function a(){}function b(){}",
+        );
+
+        let root = Span::new(fm.start_pos, fm.end_pos);
+        let first = Span::new(fm.start_pos, fm.start_pos + BytePos(16));
+        // Overlaps `first`, e.g. because a transform produced an inconsistent span.
+        let overlapping = Span::new(fm.start_pos + BytePos(10), fm.end_pos);
+
+        let scopes = vec![
+            make_scope(None, ScopeKind::Module, None, root, 0, 28, &[]),
+            make_scope(Some(0), ScopeKind::Function, Some("a"), first, 0, 14, &[]),
+            make_scope(
+                Some(0),
+                ScopeKind::Function,
+                Some("b"),
+                overlapping,
+                14,
+                28,
+                &[],
+            ),
+        ];
+
+        let map = swc_sourcemap::SourceMap::from_slice(
+            br#"{
+                "version": 3,
+                "sources": ["input.js"],
+                "names": ["module", "function", "a", "b"],
+                "mappings": "AAAA"
+            }"#,
+        )
+        .unwrap();
+
+        let encoded = encode_scopes(&scopes, &cm, &map, |file_name| file_name.to_string())
+            .expect("should encode");
+        let items = encoded.split(',').collect::<Vec<_>>();
+        // Original scopes: the module and `a` only (start and end items each).
+        assert_eq!(items.iter().filter(|i| i.starts_with('B')).count(), 2);
+        assert_eq!(items.iter().filter(|i| i.starts_with('C')).count(), 2);
+        // All three generated ranges are kept, the one for `b` without a definition
+        // (flags: 0x4 stack frame only).
+        assert_eq!(items.iter().filter(|i| i.starts_with('E')).count(), 3);
+        assert!(items.contains(&"EEA"), "{encoded}");
     }
 
     #[test]

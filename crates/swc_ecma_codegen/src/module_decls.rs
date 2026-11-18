@@ -4,7 +4,7 @@ use swc_ecma_codegen_macros::node_impl;
 
 #[cfg(swc_ast_unknown)]
 use crate::unknown_error;
-use crate::{util::StartsWithAlphaNum, ListFormat};
+use crate::{text_writer::BindingStorage, util::StartsWithAlphaNum, ListFormat};
 
 #[node_impl]
 impl MacroNode for ModuleDecl {
@@ -49,6 +49,9 @@ impl MacroNode for ExportDecl {
                 keyword!(emitter, "export");
 
                 space!(emitter);
+                // `emit_class_decl_inner` bypasses `ClassDecl::emit`, which records the
+                // class binding for source map scopes, so record it here.
+                emitter.add_scope_ident_binding(&decl.ident, BindingStorage::Lexical)?;
                 emitter.emit_class_decl_inner(decl, true)?;
             }
             _ => {
@@ -101,6 +104,17 @@ impl MacroNode for ExportDefaultDecl {
         space!(emitter);
         keyword!(emitter, "default");
         space!(emitter);
+        // A named `export default function f() {}` / `export default class C {}`
+        // declares `f` / `C` in the module scope.
+        match &self.decl {
+            DefaultDecl::Fn(FnExpr {
+                ident: Some(ident), ..
+            }) => emitter.add_scope_ident_binding(ident, BindingStorage::Hoisted)?,
+            DefaultDecl::Class(ClassExpr {
+                ident: Some(ident), ..
+            }) => emitter.add_scope_ident_binding(ident, BindingStorage::Lexical)?,
+            _ => {}
+        }
         match self.decl {
             DefaultDecl::Class(ref n) => emit!(n),
             DefaultDecl::Fn(ref n) => emit!(n),

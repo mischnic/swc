@@ -127,8 +127,7 @@ impl MacroNode for Decl {
 #[node_impl]
 impl MacroNode for ClassDecl {
     fn emit(&mut self, emitter: &mut Macro) -> Result {
-        let name = self.ident.sym.as_ref();
-        emitter.add_scope_variable(name, Some(name), BindingStorage::Lexical)?;
+        emitter.add_scope_ident_binding(&self.ident, BindingStorage::Lexical)?;
         emitter.emit_class_decl_inner(self, false)?;
         Ok(())
     }
@@ -166,7 +165,7 @@ impl MacroNode for FnDecl {
 
         srcmap!(emitter, self, true);
         let fn_name = self.ident.sym.as_ref();
-        emitter.add_scope_variable(fn_name, Some(fn_name), BindingStorage::Hoisted)?;
+        emitter.add_scope_ident_binding(&self.ident, BindingStorage::Hoisted)?;
         emitter.start_scope(
             Some(fn_name),
             ScopeKind::Function,

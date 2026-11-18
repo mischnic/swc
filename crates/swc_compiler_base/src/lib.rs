@@ -31,7 +31,7 @@ use swc_ecma_parser::{
 };
 use swc_ecma_visit::{noop_visit_type, Visit, VisitWith};
 
-mod source_map_scopes;
+pub mod source_map_scopes;
 
 #[cfg(feature = "node")]
 #[napi_derive::napi(object)]
@@ -274,7 +274,7 @@ where
         if should_emit_scope_map {
             if let Some(scope_buf) = scope_buf.as_deref() {
                 let encoded_scopes =
-                    source_map_scopes::encode_scopes(scope_buf, &cm, map, |file_name| {
+                    source_map_scopes::encode_scopes(scope_buf, &*cm, map, |file_name| {
                         map_file_name_to_source(source_file_name, output_path.as_deref(), file_name)
                     });
 
